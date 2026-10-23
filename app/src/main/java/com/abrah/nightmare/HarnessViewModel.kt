@@ -8402,6 +8402,14 @@ class HarnessViewModel(app: Application) : AndroidViewModel(app) {
             }
             val label = rolled.labelFor(overrides)
             say("  run ${i + 1}/${combos.size}  $label")
+            // The previous iteration may have released the backend to free
+            // memory. The sweep-level preflight only prepares the first run,
+            // so reacquire the backend for this exact graph before every run.
+            if (!ops.ensureBackendFor(graph, typesFor(graph))) {
+                runError = backendRefusal(namesNoKey = false)
+                say("batch: stopped before run ${i + 1}. $runError", bad = true)
+                break
+            }
             val r = ops.runWorkflow(
                 canvas.workflow.copy(graph = graph),
                 onStart = { id, _ ->
