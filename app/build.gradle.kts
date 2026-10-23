@@ -1,16 +1,16 @@
 ﻿import java.util.Properties
 
-// These switches are only for the cloud batch-fix build. Normal builds keep
-// compiling native code and keep the official application ID.
-val usePrebuiltNative = providers.gradleProperty("nightmarePrebuiltNative").orNull == "true"
-val batchFixBuild = providers.gradleProperty("nightmareBatchFix").orNull == "true"
-
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
     id("org.jetbrains.kotlin.plugin.compose")
     id("io.github.takahirom.roborazzi")
 }
+
+// These switches are only for the cloud batch-fix build. Normal builds keep
+// compiling native code and keep the official application ID.
+val usePrebuiltNative = providers.gradleProperty("nightmarePrebuiltNative").orNull == "true"
+val batchFixBuild = providers.gradleProperty("nightmareBatchFix").orNull == "true"
 
 /**
  * â­â­ Release signing, read from OUTSIDE the repository.
