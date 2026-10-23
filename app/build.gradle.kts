@@ -1,5 +1,10 @@
 ﻿import java.util.Properties
 
+// These switches are only for the cloud batch-fix build. Normal builds keep
+// compiling native code and keep the official application ID.
+val usePrebuiltNative = providers.gradleProperty("nightmarePrebuiltNative").orNull == "true"
+val batchFixBuild = providers.gradleProperty("nightmareBatchFix").orNull == "true"
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
@@ -36,7 +41,7 @@ android {
     compileSdk = 35
 
     defaultConfig {
-        applicationId = "com.abrah.nightmare"
+        applicationId = if (batchFixBuild) "com.abrah.nightmare.batchfix" else "com.abrah.nightmare"
         // 31 to match DreamUI. The backend and QNN runtime set the real floor;
         // there is no reason to support anything the NPU path cannot run on.
         minSdk = 31
@@ -65,8 +70,10 @@ android {
         // and does not compile without one. â­ STATIC rather than shared so the
         // STL is linked into libnmqnn.so and no `libc++_shared.so` has to be
         // packaged -- libnmjs.so is C and links none of it either way.
-        externalNativeBuild {
-            cmake { arguments += "-DANDROID_STL=c++_static" }
+        if (!usePrebuiltNative) {
+            externalNativeBuild {
+                cmake { arguments += "-DANDROID_STL=c++_static" }
+            }
         }
     }
 
@@ -75,10 +82,12 @@ android {
     // executable, and its tree is CC BY-NC and uncommittable). libnmjs.so is
     // ours plus MIT QuickJS, so it is a normal Gradle native build -- and that
     // means it cannot silently go stale the way a staged binary can.
-    externalNativeBuild {
-        cmake {
-            path = file("src/main/cpp/CMakeLists.txt")
-            version = "3.22.1"
+    if (!usePrebuiltNative) {
+        externalNativeBuild {
+            cmake {
+                path = file("src/main/cpp/CMakeLists.txt")
+                version = "3.22.1"
+            }
         }
     }
 
