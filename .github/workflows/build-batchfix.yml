@@ -1,0 +1,99 @@
+name: Build batch-fix APK
+
+on:
+  workflow_dispatch:
+
+# Read-only is sufficient: the job only downloads source/dependencies and uploads
+# its APK as a workflow artifact. It does not write to releases or repository files.
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install SDK components needed by Foxlet
+        run: |
+          yes | sdkmanager --licenses >/dev/null 2>&1 || true
+          sdkmanager "platforms;android-35" "build-tools;35.0.0" "ndk;29.0.14206865" "cmake;4.1.2"
+
+      - name: Stage unchanged native libraries from the latest published app
+        run: |
+          set -euo pipefail
+          APK="$RUNNER_TEMP/nightmare-1.6.218.apk"
+          curl --fail --location --retry 3 --output "$APK" \
+            "https://github.com/AbrahamPaulJ/nightmare-mobile/releases/download/v1.6.218/nightmare-1.6.218.apk"
+          echo "6f22124de1b783dbc6069987384ab09c06b4f6aa5f32193b14ba5d49ed08e4b2  $APK" | sha256sum --check
+          python3 - "$APK" <<'PY'
+          import pathlib
+          import sys
+          import zipfile
+
+          apk = pathlib.Path(sys.argv[1])
+          root = pathlib.Path.cwd()
+          with zipfile.ZipFile(apk) as archive:
+              names = archive.namelist()
+              native = [n for n in names if n.startswith("lib/arm64-v8a/") and n.endswith(".so")]
+              qnn = [n for n in names if n.startswith("assets/qnnlibs/") and not n.endswith("/")]
+              if not native:
+                  raise SystemExit("Released APK has no arm64 native libraries")
+              if not qnn:
+                  raise SystemExit("Released APK has no assets/qnnlibs runtime files")
+              for name in native:
+                  rel = pathlib.PurePosixPath(name).relative_to("lib/arm64-v8a")
+                  target = root / "app/src/main/jniLibs/arm64-v8a" / pathlib.Path(*rel.parts)
+                  target.parent.mkdir(parents=True, exist_ok=True)
+                  target.write_bytes(archive.read(name))
+              for name in qnn:
+                  rel = pathlib.PurePosixPath(name).relative_to("assets/qnnlibs")
+                  target = root / "app/src/main/assets/qnnlibs" / pathlib.Path(*rel.parts)
+                  target.parent.mkdir(parents=True, exist_ok=True)
+                  target.write_bytes(archive.read(name))
+          required_native = [
+              root / "app/src/main/jniLibs/arm64-v8a/libstable_diffusion_core.so",
+              root / "app/src/main/jniLibs/arm64-v8a/libnmjs.so",
+              root / "app/src/main/jniLibs/arm64-v8a/libnmqnn.so",
+          ]
+          missing = [str(p) for p in required_native if not p.is_file()]
+          if missing:
+              raise SystemExit("Missing native libraries: " + ", ".join(missing))
+          print(f"Staged {len(native)} native libraries and {len(qnn)} QNN runtime files")
+          PY
+
+      - name: Build Foxlet AAR from source
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python-is-python3
+          bash tools/build_foxlet.sh
+
+      - name: Compile the batch-fix app
+        run: |
+          chmod +x gradlew
+          ./gradlew --no-daemon --stacktrace \
+            -PnightmarePrebuiltNative=true \
+            -PnightmareBatchFix=true \
+            assembleDebug
+          mkdir -p out
+          cp app/build/outputs/apk/debug/app-debug.apk out/nightmare-batch-fix.apk
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: nightmare-batch-fix-apk
+          path: out/nightmare-batch-fix.apk
+          if-no-files-found: error
+          retention-days: 7
