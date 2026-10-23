@@ -2,6 +2,12 @@ name: Build batch-fix APK
 
 on:
   workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/build-batchfix.yml"
+      - "app/src/main/java/com/abrah/nightmare/HarnessViewModel.kt"
+      - "app/build.gradle.kts"
 
 # Read-only is sufficient: the job only downloads source/dependencies and uploads
 # its APK as a workflow artifact. It does not write to releases or repository files.
@@ -25,6 +31,10 @@ jobs:
 
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
+        with:
+          # "tools" is obsolete in current SDK repositories; requesting it
+          # makes sdkmanager exit non-zero before the build can start.
+          packages: platform-tools
 
       - name: Install SDK components needed by Foxlet
         run: |
