@@ -6,11 +6,7 @@ on:
     branches: [main]
     paths:
       - ".github/workflows/build-batchfix.yml"
-      - "app/src/main/java/com/abrah/nightmare/HarnessViewModel.kt"
-      - "app/build.gradle.kts"
 
-# Read-only is sufficient: the job only downloads source/dependencies and uploads
-# its APK as a workflow artifact. It does not write to releases or repository files.
 permissions:
   contents: read
 
@@ -19,8 +15,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
-      - name: Check out source
+      # Build from the exact source revision of the user's original 1.6.216 APK.
+      # Only the batch loop is patched, avoiding unrelated UI changes from later versions.
+      - name: Check out original 1.6.216 source
         uses: actions/checkout@v4
+        with:
+          ref: 332c37973f2e76574cbfc00be00931bc740c5631
 
       - name: Install Java 17
         uses: actions/setup-java@v4
@@ -32,8 +32,6 @@ jobs:
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
         with:
-          # "tools" is obsolete in current SDK repositories; requesting it
-          # makes sdkmanager exit non-zero before the build can start.
           packages: platform-tools
 
       - name: Install SDK components needed by Foxlet
@@ -41,13 +39,92 @@ jobs:
           yes | sdkmanager --licenses >/dev/null 2>&1 || true
           sdkmanager "platforms;android-35" "build-tools;35.0.0" "ndk;29.0.14206865" "cmake;4.1.2"
 
-      - name: Stage unchanged native libraries from the latest published app
+      - name: Apply the minimal batch-loop fix and enable prebuilt native inputs
         run: |
           set -euo pipefail
-          APK="$RUNNER_TEMP/nightmare-1.6.218.apk"
+          python3 <<'PY'
+          from pathlib import Path
+
+          vm = Path("app/src/main/java/com/abrah/nightmare/HarnessViewModel.kt")
+          source = vm.read_text()
+          anchor = '            say("  run ${i + 1}/${combos.size}  $label")\n            val r = ops.runWorkflow('
+          replacement = '''            say("  run ${i + 1}/${combos.size}  $label")
+                      // A preceding render may have released the backend to protect RAM.
+                      // Re-start/check it before every iteration, not just once per batch.
+                      if (!ops.ensureBackendFor(graph, typesFor(graph))) {
+                          runError = backendRefusal(namesNoKey = false)
+                          say("batch: stopped before run ${i + 1}. $runError", bad = true)
+                          break
+                      }
+                      if (cancelBatch) {
+                          say("batch: stopped after $done of ${combos.size}", bad = true)
+                          break
+                      }
+                      val r = ops.runWorkflow('''
+          if source.count(anchor) != 1:
+              raise SystemExit("Batch loop anchor not unique; refusing to patch source")
+          vm.write_text(source.replace(anchor, replacement, 1))
+
+          gradle = Path("app/build.gradle.kts")
+          text = gradle.read_text(encoding="utf-8-sig")
+          plugins = '''plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+              id("org.jetbrains.kotlin.plugin.compose")
+              id("io.github.takahirom.roborazzi")
+          }'''
+          if text.count(plugins) != 1:
+              raise SystemExit("Gradle plugins block not found exactly once")
+          text = text.replace(plugins, plugins + '''
+
+          // Test-only build flags: reuse the exact native binaries already in the original APK.
+          val usePrebuiltNative = providers.gradleProperty("nightmarePrebuiltNative").orNull == "true"
+          val batchFixBuild = providers.gradleProperty("nightmareBatchFix").orNull == "true"
+          ''', 1)
+
+          app_id = 'applicationId = "com.abrah.nightmare"'
+          if text.count(app_id) != 1:
+              raise SystemExit("applicationId not found exactly once")
+          text = text.replace(app_id, 'applicationId = if (batchFixBuild) "com.abrah.nightmare.batchfix2" else "com.abrah.nightmare"', 1)
+
+          default_native = '''        externalNativeBuild {
+                      cmake { arguments += "-DANDROID_STL=c++_static" }
+                  }'''
+          if text.count(default_native) != 1:
+              raise SystemExit("defaultConfig native block not found exactly once")
+          text = text.replace(default_native, '''        if (!usePrebuiltNative) {
+                      externalNativeBuild {
+                          cmake { arguments += "-DANDROID_STL=c++_static" }
+                      }
+                  }''', 1)
+
+          main_native = '''    externalNativeBuild {
+                  cmake {
+                      path = file("src/main/cpp/CMakeLists.txt")
+                      version = "3.22.1"
+                  }
+              }'''
+          if text.count(main_native) != 1:
+              raise SystemExit("Android native build block not found exactly once")
+          text = text.replace(main_native, '''    if (!usePrebuiltNative) {
+                  externalNativeBuild {
+                      cmake {
+                          path = file("src/main/cpp/CMakeLists.txt")
+                          version = "3.22.1"
+                      }
+                  }
+              }''', 1)
+          gradle.write_text(text, encoding="utf-8-sig")
+          print("Patched only the batch loop; native build is configured to use original APK libraries.")
+          PY
+
+      - name: Stage verified native libraries and DSP skels from the original 1.6.216 APK
+        run: |
+          set -euo pipefail
+          APK="$RUNNER_TEMP/nightmare-1.6.216.apk"
           curl --fail --location --retry 3 --output "$APK" \
-            "https://github.com/AbrahamPaulJ/nightmare-mobile/releases/download/v1.6.218/nightmare-1.6.218.apk"
-          echo "6f22124de1b783dbc6069987384ab09c06b4f6aa5f32193b14ba5d49ed08e4b2  $APK" | sha256sum --check
+            "https://github.com/AbrahamPaulJ/nightmare-mobile/releases/download/v1.6.216/nightmare-1.6.216.apk"
+          echo "4e90acc8404c93fc7fd229495e45be5762994cc963f37f637917dd36feb423bd  $APK" | sha256sum --check
           python3 - "$APK" <<'PY'
           import pathlib
           import sys
@@ -59,10 +136,9 @@ jobs:
               names = archive.namelist()
               native = [n for n in names if n.startswith("lib/arm64-v8a/") and n.endswith(".so")]
               qnn = [n for n in names if n.startswith("assets/qnnlibs/") and not n.endswith("/")]
-              if not native:
-                  raise SystemExit("Released APK has no arm64 native libraries")
-              if not qnn:
-                  raise SystemExit("Released APK has no assets/qnnlibs runtime files")
+              dit = [n for n in names if n.startswith("assets/ditlibs/") and not n.endswith("/")]
+              if not native or not qnn or not dit:
+                  raise SystemExit(f"Missing payloads: native={len(native)}, qnn={len(qnn)}, dit skels={len(dit)}")
               for name in native:
                   rel = pathlib.PurePosixPath(name).relative_to("lib/arm64-v8a")
                   target = root / "app/src/main/jniLibs/arm64-v8a" / pathlib.Path(*rel.parts)
@@ -73,15 +149,21 @@ jobs:
                   target = root / "app/src/main/assets/qnnlibs" / pathlib.Path(*rel.parts)
                   target.parent.mkdir(parents=True, exist_ok=True)
                   target.write_bytes(archive.read(name))
-          required_native = [
+              for name in dit:
+                  rel = pathlib.PurePosixPath(name).relative_to("assets/ditlibs")
+                  target = root / "app/src/main/assets/ditlibs" / pathlib.Path(*rel.parts)
+                  target.parent.mkdir(parents=True, exist_ok=True)
+                  target.write_bytes(archive.read(name))
+          required = [
               root / "app/src/main/jniLibs/arm64-v8a/libstable_diffusion_core.so",
               root / "app/src/main/jniLibs/arm64-v8a/libnmjs.so",
               root / "app/src/main/jniLibs/arm64-v8a/libnmqnn.so",
+              root / "app/src/main/assets/ditlibs/libggml-htp-v75.so",
           ]
-          missing = [str(p) for p in required_native if not p.is_file()]
+          missing = [str(p) for p in required if not p.is_file()]
           if missing:
-              raise SystemExit("Missing native libraries: " + ", ".join(missing))
-          print(f"Staged {len(native)} native libraries and {len(qnn)} QNN runtime files")
+              raise SystemExit("Missing required payloads: " + ", ".join(missing))
+          print(f"Staged {len(native)} native libraries, {len(qnn)} QNN runtime files, and {len(dit)} DSP skels")
           PY
 
       - name: Build Foxlet AAR from source
@@ -90,20 +172,36 @@ jobs:
           sudo apt-get install -y python-is-python3
           bash tools/build_foxlet.sh
 
-      - name: Compile the batch-fix app
+      - name: Compile optimized batch-fix release
         run: |
+          set -euo pipefail
           chmod +x gradlew
           ./gradlew --no-daemon --stacktrace \
             -PnightmarePrebuiltNative=true \
             -PnightmareBatchFix=true \
-            assembleDebug
+            assembleRelease
           mkdir -p out
-          cp app/build/outputs/apk/debug/app-debug.apk out/nightmare-batch-fix.apk
+          APK_UNSIGNED="$(find app/build/outputs/apk/release -maxdepth 1 -type f -name '*.apk' | head -n 1)"
+          test -n "$APK_UNSIGNED"
+          # This is a personal test variant, not the official app. Use a one-off
+          # test signing key; the package id is distinct so it can coexist safely.
+          keytool -genkeypair -noprompt \
+            -keystore "$RUNNER_TEMP/nightmare-batchfix-test.keystore" \
+            -storepass "batchfix-test" -keypass "batchfix-test" -alias batchfix-test \
+            -keyalg RSA -keysize 2048 -validity 10000 \
+            -dname "CN=Nightmare Batch Fix Test, O=Local Test Build, C=US"
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" sign \
+            --ks "$RUNNER_TEMP/nightmare-batchfix-test.keystore" \
+            --ks-pass pass:batchfix-test --key-pass pass:batchfix-test \
+            --ks-key-alias batchfix-test \
+            --out out/nightmare-batch-fix-optimized.apk "$APK_UNSIGNED"
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose out/nightmare-batch-fix-optimized.apk
+          ls -lh out/nightmare-batch-fix-optimized.apk
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: nightmare-batch-fix-apk
-          path: out/nightmare-batch-fix.apk
+          name: nightmare-batch-fix-optimized-apk
+          path: out/nightmare-batch-fix-optimized.apk
           if-no-files-found: error
           retention-days: 7
